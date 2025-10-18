@@ -24,3 +24,22 @@ coverage/
 # IDE
 .vscode/
 .idea/
+.cursor/
+
+# Test artifacts
+nul
+test-results.json
+mcp-stderr.log
+
+# Temporary test directories
+claude-cli-test/
+cli-test/
+test-multistep/
+
+# Claude/Cursor working directories
+.claude/
+.claude-tasks/
+
+# Temporary files
+task.md
+quick-mcp-client.js
