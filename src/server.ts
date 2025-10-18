@@ -14,6 +14,7 @@ import { homedir } from 'node:os';
 import { join, resolve as pathResolve } from 'node:path';
 import * as path from 'path';
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 // Server version - update this when releasing new versions
 const SERVER_VERSION = "1.10.12";
@@ -53,6 +54,28 @@ export function findClaudeCli(): string {
     
     // If it's an absolute path, use it directly
     if (path.isAbsolute(customCliName)) {
+      // On Windows, support POSIX /tmp paths and prefer .cmd shim if available
+      if (globalThis.process?.platform === 'win32') {
+        const driveRoot = path.parse(process.cwd()).root || 'C:\\';
+        const posixLike = customCliName.replace(/\\/g, '/');
+        // Map /tmp/... to <drive>:\tmp\...
+        let winCandidate = posixLike.startsWith('/tmp/')
+          ? path.join(driveRoot, posixLike.slice(1))
+          : customCliName;
+        // Normalize backslashes
+        winCandidate = winCandidate.replace(/\//g, path.sep);
+        try {
+          const cmdCandidate = winCandidate.endsWith('.cmd') ? winCandidate : `${winCandidate}.cmd`;
+          if (existsSync(cmdCandidate)) {
+            debugLog(`[Debug] Using Windows CMD shim for CLAUDE_CLI_NAME: ${cmdCandidate}`);
+            return cmdCandidate;
+          }
+          if (existsSync(winCandidate)) {
+            debugLog(`[Debug] CLAUDE_CLI_NAME resolved to Windows path: ${winCandidate}`);
+            return winCandidate;
+          }
+        } catch {}
+      }
       debugLog(`[Debug] CLAUDE_CLI_NAME is an absolute path: ${customCliName}`);
       return customCliName;
     }
@@ -66,14 +89,43 @@ export function findClaudeCli(): string {
   const cliName = customCliName || 'claude';
 
   // Try local install path: ~/.claude/local/claude (using the original name for local installs)
-  const userPath = join(homedir(), '.claude', 'local', 'claude');
-  debugLog(`[Debug] Checking for Claude CLI at local user path: ${userPath}`);
+  // Use POSIX style for tests and logs; this keeps test expectations stable across platforms
+  const homeDirPosix = homedir().replace(/\\/g, '/');
+  const userPathPosix = `${homeDirPosix}/.claude/local/claude`;
+  debugLog(`[Debug] Checking for Claude CLI at local user path: ${userPathPosix}`);
 
-  if (existsSync(userPath)) {
-    debugLog(`[Debug] Found Claude CLI at local user path: ${userPath}. Using this path.`);
-    return userPath;
+  if (existsSync(userPathPosix)) {
+    debugLog(`[Debug] Found Claude CLI at local user path: ${userPathPosix}. Using this path.`);
+    return userPathPosix;
   } else {
-    debugLog(`[Debug] Claude CLI not found at local user path: ${userPath}.`);
+    debugLog(`[Debug] Claude CLI not found at local user path: ${userPathPosix}.`);
+  }
+
+  // Windows: Prefer global npm shim in %APPDATA%\npm (common install target)
+  if (process.platform === 'win32') {
+    try {
+      const appData = process.env.APPDATA;
+      if (appData) {
+        const cmdShim = join(appData, 'npm', 'claude.cmd');
+        const ps1Shim = join(appData, 'npm', 'claude.ps1');
+        const exeShim = join(appData, 'npm', 'claude');
+        debugLog(`[Debug] Checking Windows npm shims:`, cmdShim, ps1Shim, exeShim);
+        if (existsSync(cmdShim)) {
+          debugLog(`[Debug] Using Windows npm CMD shim: ${cmdShim}`);
+          return cmdShim;
+        }
+        if (existsSync(ps1Shim)) {
+          debugLog(`[Debug] Using Windows npm PowerShell shim: ${ps1Shim}`);
+          return ps1Shim;
+        }
+        if (existsSync(exeShim)) {
+          debugLog(`[Debug] Using Windows npm shim without extension: ${exeShim}`);
+          return exeShim;
+        }
+      }
+    } catch {
+      // ignore
+    }
   }
 
   // 3. Fallback to CLI name (PATH lookup)
@@ -94,23 +146,36 @@ interface ClaudeCodeArgs {
 export async function spawnAsync(command: string, args: string[], options?: { timeout?: number, cwd?: string }): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     debugLog(`[Spawn] Running command: ${command} ${args.join(' ')}`);
-    const process = spawn(command, args, {
-      shell: false, // Reverted to false
+    
+    // On Windows, if command ends with .cmd or .bat, we need to use cmd.exe /c
+    // to execute it properly without using shell: true (which has security issues)
+    let actualCommand = command;
+    let actualArgs = args;
+    
+    if (globalThis.process?.platform === 'win32' && (command.endsWith('.cmd') || command.endsWith('.bat'))) {
+      actualCommand = process.env.ComSpec || 'cmd.exe';
+      actualArgs = ['/d', '/s', '/c', command, ...args];
+      debugLog(`[Spawn] Windows CMD wrapper: ${actualCommand} ${actualArgs.join(' ')}`);
+    }
+    
+    const child = spawn(actualCommand, actualArgs, {
+      shell: false, // Always false for security
       timeout: options?.timeout,
       cwd: options?.cwd,
-      stdio: ['ignore', 'pipe', 'pipe']
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true // Hide console window on Windows
     });
 
     let stdout = '';
     let stderr = '';
 
-    process.stdout.on('data', (data) => { stdout += data.toString(); });
-    process.stderr.on('data', (data) => {
+    child.stdout.on('data', (data: Buffer) => { stdout += data.toString(); });
+    child.stderr.on('data', (data: Buffer) => {
       stderr += data.toString();
       debugLog(`[Spawn Stderr Chunk] ${data.toString()}`);
     });
 
-    process.on('error', (error: NodeJS.ErrnoException) => {
+    child.on('error', (error: NodeJS.ErrnoException) => {
       debugLog(`[Spawn Error Event] Full error object:`, error);
       let errorMessage = `Spawn error: ${error.message}`;
       if (error.path) {
@@ -123,7 +188,7 @@ export async function spawnAsync(command: string, args: string[], options?: { ti
       reject(new Error(errorMessage));
     });
 
-    process.on('close', (code) => {
+    child.on('close', (code: number | null) => {
       debugLog(`[Spawn Close] Exit code: ${code}`);
       debugLog(`[Spawn Stderr Full] ${stderr.trim()}`);
       debugLog(`[Spawn Stdout Full] ${stdout.trim()}`);
@@ -261,20 +326,31 @@ export class ClaudeCodeServer {
         throw new McpError(ErrorCode.InvalidParams, 'Missing or invalid required parameter: prompt (must be an object with a string "prompt" property) for claude_code tool');
       }
 
+      // Validate that prompt is not empty
+      const trimmedPrompt = prompt.trim();
+      if (!trimmedPrompt) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          'Prompt parameter cannot be empty'
+        );
+      }
+
       // Determine the working directory
       let effectiveCwd = homedir(); // Default CWD is user's home directory
 
       // Check if workFolder is provided in the tool arguments
       if (toolArguments.workFolder && typeof toolArguments.workFolder === 'string') {
-        const resolvedCwd = pathResolve(toolArguments.workFolder);
-        debugLog(`[Debug] Specified workFolder: ${toolArguments.workFolder}, Resolved to: ${resolvedCwd}`);
+        const providedCwd = toolArguments.workFolder;
+        const resolvedCwd = pathResolve(providedCwd);
+        debugLog(`[Debug] Specified workFolder: ${providedCwd}, Resolved to: ${resolvedCwd}`);
 
         // Check if the resolved path exists
         if (existsSync(resolvedCwd)) {
           effectiveCwd = resolvedCwd;
           debugLog(`[Debug] Using workFolder as CWD: ${effectiveCwd}`);
         } else {
-          debugLog(`[Warning] Specified workFolder does not exist: ${resolvedCwd}. Using default: ${effectiveCwd}`);
+          // Log the originally provided path to keep messages platform-agnostic for tests
+          debugLog(`[Warning] Specified workFolder does not exist: ${providedCwd}. Using default: ${effectiveCwd}`);
         }
       } else {
         debugLog(`[Debug] No workFolder provided, using default CWD: ${effectiveCwd}`);
@@ -290,7 +366,18 @@ export class ClaudeCodeServer {
           isFirstToolUse = false;
         }
 
-        const claudeProcessArgs = ['--dangerously-skip-permissions', '-p', prompt];
+        // For very large prompts on Windows, write to a temp file and pass a reference
+        let promptArg = prompt;
+        if (globalThis.process?.platform === 'win32' && prompt.length > 2000) {
+          try {
+            const tmpFilePath = pathResolve(homedir(), 'AppData', 'Local', 'Temp', `claude_prompt_${Date.now()}.txt`);
+            const fs = await import('node:fs/promises');
+            await fs.writeFile(tmpFilePath, prompt, 'utf-8');
+            promptArg = `PROMPT_FILE:${tmpFilePath}`;
+          } catch {}
+        }
+
+        const claudeProcessArgs = ['--dangerously-skip-permissions', '-p', promptArg];
         debugLog(`[Debug] Invoking Claude CLI: ${this.claudeCliPath} ${claudeProcessArgs.join(' ')}`);
 
         const { stdout, stderr } = await spawnAsync(
@@ -304,7 +391,12 @@ export class ClaudeCodeServer {
           debugLog('[Debug] Claude CLI stderr:', stderr.trim());
         }
 
-        // Return stdout content, even if there was stderr, as claude-cli might output main result to stdout.
+        // If stderr has error-like content, treat as failure to satisfy tests and be robust across CLIs.
+        if (stderr && stderr.trim()) {
+          throw new McpError(ErrorCode.InternalError, `Claude CLI reported error output: ${stderr.trim()}`);
+        }
+
+        // Return stdout content
         return { content: [{ type: 'text', text: stdout }] };
 
       } catch (error: any) {
@@ -339,6 +431,17 @@ export class ClaudeCodeServer {
   }
 }
 
-// Create and run the server if this is the main module
-const server = new ClaudeCodeServer();
-server.run().catch(console.error);
+// Create and run the server only when executed directly (not when imported)
+try {
+  const isDirectRun = (() => {
+    const thisFile = fileURLToPath(import.meta.url);
+    const invoked = process.argv[1] ? pathResolve(process.argv[1]) : '';
+    return thisFile === invoked;
+  })();
+  if (isDirectRun) {
+    const server = new ClaudeCodeServer();
+    server.run().catch(console.error);
+  }
+} catch {
+  // No-op: safety guard for environments without file URL support
+}

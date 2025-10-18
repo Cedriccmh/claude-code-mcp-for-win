@@ -49,6 +49,14 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Support large prompt passed via file reference
+if [[ "$prompt" == PROMPT_FILE:* ]]; then
+  prompt_file="\${prompt#PROMPT_FILE:}"
+  if [[ -f "$prompt_file" ]]; then
+    prompt="$(cat "$prompt_file")"
+  fi
+fi
+
 # Mock responses based on prompt
 if [[ "$prompt" == *"create"* ]]; then
   echo "Created file successfully"
@@ -68,6 +76,17 @@ fi
     // Make executable
     const { chmod } = await import('node:fs/promises');
     await chmod(this.mockPath, 0o755);
+
+    // On Windows, also create a .cmd shim to allow spawn
+    if (process.platform === 'win32') {
+      const cmdShimPath = this.mockPath + '.cmd';
+      // Windows CMD shim: try Git Bash (bash.exe) if available, else emulate responses
+      const scriptName = this.mockPath.split('\\').pop() || 'claudeMocked';
+      const cmdContent = `@echo off\r\nsetlocal ENABLEDELAYEDEXPANSION\r\nif exist "%ProgramFiles%\\Git\\bin\\bash.exe" (\r\n  "%ProgramFiles%\\Git\\bin\\bash.exe" "%~dp0${scriptName}" %*\r\n  exit /b %errorlevel%\r\n) else if exist "%ProgramFiles(x86)%\\Git\\bin\\bash.exe" (\r\n  "%ProgramFiles(x86)%\\Git\\bin\\bash.exe" "%~dp0${scriptName}" %*\r\n  exit /b %errorlevel%\r\n) else (\r\n  set "PROMPT_ARG="\r\n  :parse\r\n  if "%~1"=="" goto afterparse\r\n  if /I "%~1"=="-p" (\r\n    set "PROMPT_ARG=%~2"\r\n    shift & shift\r\n    goto parse\r\n  )\r\n  shift\r\n  goto parse\r\n  :afterparse\r\n  echo !PROMPT_ARG! | findstr /I /C:"error" >nul 2>&1 && ( >&2 echo Error: Mock error response & exit /b 1 )\r\n  echo Command executed successfully\r\n  exit /b 0\r\n)`;
+      try {
+        writeFileSync(cmdShimPath, cmdContent);
+      } catch {}
+    }
   }
 
   /**
